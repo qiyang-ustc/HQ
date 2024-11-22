@@ -11,8 +11,8 @@ Features:
 - Colorized output for better readability
 - Automatic configuration file generation
 
-For first-time setup, run: ./hq --generate-config
-For usage examples, run: ./hq --help
+For first-time setup, run: hq --generate-config
+For usage examples, run: hq --help
 """
 
 import argparse
@@ -32,6 +32,13 @@ init()
 
 def generate_sample_config(output_path: Path) -> None:
     """Generate a sample configuration file with detailed comments."""
+    print(f"\n{Fore.CYAN}Would you like to create config interactively? (Recommended){Style.RESET_ALL}")
+    interactive = input("Enter 'y' for interactive setup, any other key for default template: ").lower().startswith('y')
+    
+    if interactive:
+        generate_interactive_config(output_path)
+        return
+        
     sample_config = {
         "default_cluster": "example_cluster",  # Default cluster to use when --cluster is not specified
         "default_cores": 2,                    # Default number of CPU cores
@@ -64,6 +71,92 @@ def generate_sample_config(output_path: Path) -> None:
     print(f"\nGenerated sample config at: {output_path}")
     print("Please edit this file with your cluster-specific settings")
     print("Tip: Use the -p option to preview commands before actual execution!")
+
+def prompt_with_default(prompt: str, default: str) -> str:
+    """Prompt user for input with a default value."""
+    response = input(f"{prompt} (default: {default}): ").strip()
+    return response if response else default
+
+def generate_interactive_config(output_path: Path) -> None:
+    """Generate configuration file interactively with user input."""
+    print(f"\n{Fore.CYAN}Welcome to HQ Configuration Setup!{Style.RESET_ALL}")
+    print("I'll help you create a configuration file for your clusters.")
+    print("Press Enter to accept default values, or type your own.\n")
+
+    # Get default cluster name
+    default_cluster = prompt_with_default("Enter your primary cluster name", "example_cluster")
+    
+    # Get default resources
+    default_cores = prompt_with_default("Default number of CPU cores", "2")
+    default_memory = prompt_with_default("Default memory in GB", "5")
+    
+    # Get cluster-specific settings
+    print(f"\n{Fore.CYAN}Now, let's configure the {default_cluster} cluster:{Style.RESET_ALL}")
+    partition = prompt_with_default("Default partition name", "compute")
+    remote_dir = prompt_with_default("Remote working directory", "/home/$USER/projects")
+    remote_dir = remote_dir.replace("$USER", os.environ.get("USER", "username"))
+    
+    # Ask about additional targets
+    print(f"\n{Fore.CYAN}Available job submission targets:{Style.RESET_ALL}")
+    print("1. default (always included)")
+    print("2. gpu    (for GPU jobs)")
+    print("3. debug  (for interactive sessions)")
+    print("4. bigmem (for high-memory jobs)")
+    targets_input = prompt_with_default("Which additional targets do you need? (e.g., '2,3' or 'all')", "1")
+    
+    # Process targets
+    targets = {
+        "default": f"sbatch --partition={partition} --cpus-per-task={{cores}} --mem={{memory}} --job-name={{filename}} ~/bin/runjob {{directory}} {{filename}}"
+    }
+    
+    if targets_input.lower() == 'all':
+        selected_targets = [2, 3, 4]
+    else:
+        selected_targets = [int(x.strip()) for x in targets_input.split(',')]
+        
+    if 2 in selected_targets or targets_input.lower() == 'all':
+        targets["gpu"] = f"sbatch --partition=gpu --cpus-per-task={{cores}} --mem={{memory}} --gres=gpu:1 --job-name={{filename}} ~/bin/runjob {{directory}} {{filename}}"
+    
+    if 3 in selected_targets or targets_input.lower() == 'all':
+        targets["debug"] = f"srun --partition={partition} --cpus-per-task={{cores}} --mem={{memory}} ~/bin/runjob {{directory}} {{filename}}"
+    
+    if 4 in selected_targets or targets_input.lower() == 'all':
+        targets["bigmem"] = f"sbatch --partition=bigmem --cpus-per-task={{cores}} --mem={{memory}} --job-name={{filename}} ~/bin/runjob {{directory}} {{filename}}"
+    
+    # Create configuration
+    config = {
+        "default_cluster": default_cluster,
+        "default_cores": int(default_cores),
+        "default_memory": int(default_memory),
+        "clusters": {
+            default_cluster: {
+                "partition": partition,
+                "remote_dir": remote_dir,
+                "targets": targets
+            }
+        }
+    }
+    
+    # Handle existing config
+    if output_path.exists():
+        backup = prompt_with_default(
+            f"\nExisting config found at {output_path}. Create backup?", "y"
+        ).lower().startswith('y')
+        
+        if backup:
+            backup_path = output_path.with_suffix('.backup')
+            output_path.rename(backup_path)
+            print(f"Existing config backed up to: {backup_path}")
+    
+    # Save configuration
+    with open(output_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    
+    print(f"\n{Fore.GREEN}Configuration generated successfully at: {output_path}{Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}Tips:{Style.RESET_ALL}")
+    print("1. Edit the file directly to add more clusters or customize settings")
+    print("2. Use -p option to preview commands before execution")
+    print("3. Run 'hq -h' to see all available options")
 
 # Load configuration from file or use defaults
 def load_config(config_path: Optional[Path] = None) -> dict:
@@ -154,7 +247,7 @@ class ColoredHelpFormatter(argparse.RawDescriptionHelpFormatter):
         
         # Colorize commands in examples
         help_str = re.sub(
-            r'(./hq[^#\n]+)',
+            r'(hq[^#\n]+)',
             Fore.GREEN + r'\1' + Style.RESET_ALL,
             help_str
         )
@@ -364,37 +457,37 @@ def parse_args():
     examples = """
 Examples:
     # 👉 HIGHLY RECOMMENDED: Preview commands before execution
-    ./hq -p myfile -c 4 -m 8     # Always use -p first to verify commands!
+    hq -p myfile -c 4 -m 8     # Always use -p first to verify commands!
     
     # Basic usage: Submit a single job
-    ./hq myfile -c 4 -m 8
+    hq myfile -c 4 -m 8
     
     # Submit multiple jobs with different resources
-    ./hq file1 file2 -c 4,8 -m 8,16
+    hq file1 file2 -c 4,8 -m 8,16
     
     # Use template expansion for parameter sweep
-    ./hq -c 4,4 -m 8,8 -l 4,5 myfile_D{}
+    hq -c 4,4 -m 8,8 -l 4,5 myfile_D{}
     # This will create and submit: myfile_D4 and myfile_D5
     
     # Submit to a specific cluster with a specific target
-    ./hq myfile -c 4 -m 8 --cluster snellius -t gpu
+    hq myfile -c 4 -m 8 --cluster snellius -t gpu
     
     # Use debug target for interactive session
-    ./hq myfile -c 4 -m 8 -t debug
+    hq myfile -c 4 -m 8 -t debug
     
     # Use bigmem target for large memory jobs
-    ./hq myfile -c 4 -m 8 -t bigmem
+    hq myfile -c 4 -m 8 -t bigmem
 
 Configuration:
     # First time setup: Generate a sample config
-    ./hq --generate-config
+    hq --generate-config
     
     The script looks for cluster configurations in ~/.cluster_profile
     Edit this file to add your clusters and customize settings.
     See the generated sample config for detailed documentation.
     
     You can also specify a custom config file:
-    ./hq myfile -c 4 -m 8 --config /path/to/config.yaml
+    hq myfile -c 4 -m 8 --config /path/to/config.yaml
     """
     
     parser = argparse.ArgumentParser(
