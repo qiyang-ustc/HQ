@@ -1,0 +1,517 @@
+#!/usr/bin/python3
+"""
+HQ (HeadQuarters) Cluster Job Submission Tool
+
+A user-friendly tool for submitting and managing jobs across different HPC clusters.
+Features:
+- Submit single or multiple jobs with different resource requirements
+- Parameter sweep support with template expansion
+- Multiple cluster support with customizable configurations
+- Preview mode to verify commands before execution
+- Colorized output for better readability
+- Automatic configuration file generation
+
+For first-time setup, run: ./hq --generate-config
+For usage examples, run: ./hq --help
+"""
+
+import argparse
+import os
+import subprocess
+import logging
+import yaml
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Dict, Optional
+from colorama import init, Fore, Style
+import sys
+import re
+
+# Initialize colorama
+init()
+
+def generate_sample_config(output_path: Path) -> None:
+    """Generate a sample configuration file with detailed comments."""
+    sample_config = {
+        "default_cluster": "example_cluster",  # Default cluster to use when --cluster is not specified
+        "default_cores": 2,                    # Default number of CPU cores
+        "default_memory": 5,                   # Default memory in GB
+        
+        "clusters": {
+            "example_cluster": {
+                "partition": "compute",         # Default partition for this cluster
+                "remote_dir": "/home/username/projects",  # Remote working directory
+                "bigmem_threshold": 32,         # Memory threshold for bigmem partition (GB)
+                "targets": {
+                    # Available job submission templates
+                    "default": "sbatch --partition={partition} --cpus-per-task={cores} --mem={memory} --job-name={filename} ~/bin/runjob {directory} {filename}",
+                    "gpu": "sbatch --partition=gpu --cpus-per-task={cores} --mem={memory} --gres=gpu:1 --job-name={filename} ~/bin/runjob {directory} {filename}",
+                    "debug": "srun --partition={partition} --cpus-per-task={cores} --mem={memory} ~/bin/runjob {directory} {filename}",
+                    "bigmem": "sbatch --partition=bigmem --cpus-per-task={cores} --mem={memory} --job-name={filename} ~/bin/runjob {directory} {filename}"
+                }
+            }
+        }
+    }
+    
+    if output_path.exists():
+        backup_path = output_path.with_suffix('.backup')
+        output_path.rename(backup_path)
+        print(f"Existing config backed up to: {backup_path}")
+    
+    with open(output_path, 'w') as f:
+        yaml.dump(sample_config, f, default_flow_style=False, sort_keys=False)
+    
+    print(f"\nGenerated sample config at: {output_path}")
+    print("Please edit this file with your cluster-specific settings")
+    print("Tip: Use the -p option to preview commands before actual execution!")
+
+# Load configuration from file or use defaults
+def load_config(config_path: Optional[Path] = None) -> dict:
+    # Default configuration
+    default_config = {
+        "clusters": {
+            "snellius": {
+                "partition": "normal",
+                "remote_dir": "/home/qyang1/tn/proj/kitaev32",
+                "targets": {
+                    "default": "sbatch --job-name={filename} --cpus-per-task={cores} --mem={memory} ~/bin/runjob {directory} {filename}",
+                    "gpu": "sbatch --job-name={filename} --cpus-per-task={cores} --mem={memory} --gres=gpu:1 ~/bin/runjob {directory} {filename}",
+                    "debug": "srun --job-name={filename} --cpus-per-task={cores} --mem={memory} ~/bin/runjob {directory} {filename}"
+                }
+            },
+            "oblix": {
+                "partition": "lln",
+                "bigmem_threshold": 10,
+                "remote_dir": "/home/qyang1/tn/proj/kitaev32",
+                "targets": {
+                    "default": "sbatch --partition={partition} --cpus-per-task={cores} --mem={memory} --job-name={filename} ~/bin/runjob {directory} {filename}",
+                    "gpu": "sbatch --partition=gpu --cpus-per-task={cores} --mem={memory} --gres=gpu:1 --job-name={filename} ~/bin/runjob {directory} {filename}",
+                    "debug": "srun --partition={partition} --cpus-per-task={cores} --mem={memory} ~/bin/runjob {directory} {filename}",
+                    "bigmem": "sbatch --partition=bigmem --cpus-per-task={cores} --mem={memory} --job-name={filename} ~/bin/runjob {directory} {filename}"
+                }
+            }
+        },
+        "default_cluster": "oblix",
+        "default_cores": 2,
+        "default_memory": 5,  # GB
+        "default_cluster_config": {  # Default configuration for any new cluster
+            "partition": "normal",
+            "remote_dir": "/home/qyang1/tn/proj/kitaev32",
+            "targets": {
+                "default": "sbatch --job-name={filename} --cpus-per-task={cores} --mem={memory} ~/bin/runjob {directory} {filename}"
+            }
+        }
+    }
+    
+    # Try loading from ~/.cluster_profile if no config path specified
+    if config_path is None:
+        config_path = Path.home() / '.cluster_profile'
+    
+    if config_path.exists():
+        with open(config_path) as f:
+            return {**default_config, **yaml.safe_load(f)}
+    return default_config
+
+class ColorFormatter(logging.Formatter):
+    """Custom formatter for colored output"""
+    def format(self, record):
+        if hasattr(record, 'highlight') and record.highlight:
+            return record.msg
+        return super().format(record)
+
+class ColoredHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Custom formatter for using colors in argparse help"""
+    def __init__(self, prog):
+        super().__init__(prog)
+        self.program = Fore.GREEN + Style.BRIGHT + prog + Style.RESET_ALL
+
+    def _format_action(self, action):
+        # Colorize argument names
+        if action.option_strings:
+            action.option_strings = [
+                Fore.YELLOW + Style.BRIGHT + opt + Style.RESET_ALL 
+                for opt in action.option_strings
+            ]
+        if action.help:
+            action.help = Fore.WHITE + action.help + Style.RESET_ALL
+        return super()._format_action(action)
+
+    def format_help(self):
+        # Add colors to sections
+        help_str = super().format_help()
+        help_str = help_str.replace(
+            "usage:", 
+            Fore.CYAN + Style.BRIGHT + "usage:" + Style.RESET_ALL
+        )
+        help_str = help_str.replace(
+            "Examples:",
+            Fore.CYAN + Style.BRIGHT + "Examples:" + Style.RESET_ALL
+        )
+        help_str = help_str.replace(
+            "Configuration:",
+            Fore.CYAN + Style.BRIGHT + "Configuration:" + Style.RESET_ALL
+        )
+        
+        # Colorize commands in examples
+        help_str = re.sub(
+            r'(./hq[^#\n]+)',
+            Fore.GREEN + r'\1' + Style.RESET_ALL,
+            help_str
+        )
+        
+        # Colorize YAML content
+        help_str = re.sub(
+            r'(default_cluster|default_cores|default_memory|clusters|partition|bigmem_threshold|targets|remote_dir)(:)',
+            Fore.YELLOW + r'\1' + Style.RESET_ALL + r'\2',
+            help_str
+        )
+        
+        # Colorize comments
+        help_str = re.sub(
+            r'(#[^\n]+)',
+            Fore.BLUE + Style.BRIGHT + r'\1' + Style.RESET_ALL,
+            help_str
+        )
+        
+        return help_str
+
+def setup_logging(verbose: bool = False):
+    """Configure logging with color support."""
+    handler = logging.StreamHandler()
+    handler.setFormatter(ColorFormatter('%(message)s'))
+    logging.root.handlers = []
+    logging.root.addHandler(handler)
+    logging.root.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+def highlight_command(cmd: str) -> str:
+    """Highlight command components."""
+    parts = cmd.split()
+    highlighted_parts = []
+    for part in parts:
+        if part.startswith('--'):
+            # Options in cyan
+            highlighted_parts.append(f"{Fore.CYAN}{part}{Style.RESET_ALL}")
+        elif '.' in part or part.startswith('$HOME') or ':' in part:
+            # Files and paths in green
+            highlighted_parts.append(f"{Fore.GREEN}{part}{Style.RESET_ALL}")
+        elif part in ['sbatch', 'scp', 'ssh']:
+            # Commands in yellow
+            highlighted_parts.append(f"{Fore.YELLOW}{part}{Style.RESET_ALL}")
+        else:
+            highlighted_parts.append(part)
+    return ' '.join(highlighted_parts)
+
+@dataclass
+class JobConfig:
+    """Configuration for a job submission."""
+    ncores: int = 2
+    memory_gb: int = 5
+    partition: Optional[str] = None
+    cluster: str = "oblix"
+
+class ClusterConfig:
+    """Cluster configuration and utilities."""
+    def __init__(self, config_path: Optional[Path] = None):
+        self.config = load_config(config_path)
+        self.logger = logging.getLogger(__name__)
+
+    def get_cluster_config(self, cluster_name: str) -> dict:
+        """Get cluster configuration, using defaults if cluster is not in config."""
+        if cluster_name not in self.config["clusters"]:
+            # Create a new cluster config using defaults
+            self.config["clusters"][cluster_name] = self.config["default_cluster_config"].copy()
+        return self.config["clusters"][cluster_name]
+
+class JobManager:
+    """Handles job creation and submission."""
+    def __init__(self, cluster_config: ClusterConfig):
+        self.cluster_config = cluster_config
+        self.logger = logging.getLogger(__name__)
+
+    def process_job_configs(self, files: List[str], cores: Optional[str], memory: Optional[str]) -> List[JobConfig]:
+        """Process job configurations from command line arguments."""
+        if cores:
+            cores = [int(c) for c in cores.split(',')]
+        if memory:
+            memory = [float(m) for m in memory.split(',')]
+
+        num_files = len(files)
+        default_cores = self.cluster_config.config["default_cores"]
+        default_memory = self.cluster_config.config["default_memory"]
+
+        # Use provided values or defaults
+        cores_list = cores if cores else [default_cores] * num_files
+        memory_list = memory if memory else [default_memory] * num_files
+
+        # Ensure lists are the same length as files
+        if len(cores_list) == 1:
+            cores_list = cores_list * num_files
+        if len(memory_list) == 1:
+            memory_list = memory_list * num_files
+
+        if len(cores_list) != num_files or len(memory_list) != num_files:
+            raise ValueError("Number of cores/memory values must match number of files or be a single value")
+
+        return [JobConfig(ncores=c, memory_gb=m, cluster=self.cluster_config.config["default_cluster"]) 
+                for c, m in zip(cores_list, memory_list)]
+
+    def create_param_file(self, basename: str, simulation_file: str) -> None:
+        """Create parameterized simulation file."""
+        try:
+            input_file = Path(basename)
+            output_file = Path(simulation_file)
+            
+            if not input_file.exists():
+                raise FileNotFoundError(f"Base file {input_file} not found")
+                
+            file_content = input_file.read_text()
+            param_content = file_content.replace("#", simulation_file)
+            output_file.write_text(param_content)
+            self.logger.info(f"{Fore.WHITE}{Style.BRIGHT}Created file: {output_file}{Style.RESET_ALL}")
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Failed to create parameter file {output_file}: {str(e)}{Style.RESET_ALL}")
+            raise
+
+    def generate_sbatch_command(self, job_config: JobConfig, filename: str, directory: str, target: str = "default") -> str:
+        """Generate sbatch command based on configuration and target."""
+        cluster = self.cluster_config.get_cluster_config(job_config.cluster)
+        
+        # Get the command template for the specified target
+        if target not in cluster.get("targets", {}):
+            self.logger.warning(f"{Fore.YELLOW}Target '{target}' not found, using 'default'{Style.RESET_ALL}")
+            target = "default"
+        
+        command_template = cluster["targets"][target]
+        
+        # Default (oblix) case memory calculation for partition selection
+        if job_config.cluster == "oblix" and "{partition}" in command_template:
+            mem_per_task = job_config.memory_gb if job_config.ncores == 1 else job_config.memory_gb / (job_config.ncores / 2)
+            partition = "bigmem" if mem_per_task > cluster['bigmem_threshold'] else cluster['partition']
+        else:
+            partition = cluster.get('partition', 'normal')
+        
+        return command_template.format(
+            partition=partition,
+            cores=job_config.ncores,
+            memory=int(job_config.memory_gb * 1000),
+            filename=filename,
+            directory=directory
+        )
+
+    def sync_and_launch_multiple(self, files: List[str], job_configs: List[JobConfig], preview: bool = False, target: str = "default") -> None:
+        """Synchronize files and execute commands for multiple jobs with different configurations."""
+        # Check for missing files first
+        missing_files = []
+        local_file_paths = []
+        for file in files:
+            if not os.path.exists(file):
+                missing_files.append(file)
+            local_file_paths.append(os.path.abspath(file))
+        
+        if missing_files:
+            raise FileNotFoundError(f"Files not found: {', '.join(missing_files)}")
+
+        sync_commands = []
+        ssh_commands = []
+        
+        for file, job_config in zip(files, job_configs):
+            cluster_config = self.cluster_config.get_cluster_config(job_config.cluster)
+            remote_dir = cluster_config["remote_dir"]
+            
+            # Get the project directory from the remote path
+            project_dir = os.path.basename(remote_dir)
+            
+            # Use scp for file transfer
+            sync_commands.append(f"scp {file} {job_config.cluster}:{remote_dir}/")
+            
+            # Generate sbatch command and wrap it in ssh
+            sbatch_cmd = self.generate_sbatch_command(job_config, file, project_dir, target)
+            ssh_commands.append(f"ssh {job_config.cluster} 'cd {remote_dir} && {sbatch_cmd}'")
+
+        if preview:
+            log = logging.getLogger(__name__)
+            log.info(f"\n{Fore.WHITE}{Style.BRIGHT}Commands to be executed:{Style.RESET_ALL}")
+            
+            log.info(f"\n{Fore.WHITE}{Style.BRIGHT}File sync and job script creation:{Style.RESET_ALL}")
+            for cmd in sync_commands:
+                preview_msg = highlight_command(cmd)
+                log.info(preview_msg, extra={'highlight': True})
+            
+            if ssh_commands:
+                log.info(f"\n{Fore.WHITE}{Style.BRIGHT}Job submissions:{Style.RESET_ALL}")
+                for cmd in ssh_commands:
+                    preview_msg = highlight_command(cmd)
+                    log.info(preview_msg, extra={'highlight': True})
+            return
+        
+        try:
+            # Sync files
+            self.logger.info(f"{Fore.WHITE}{Style.BRIGHT}Synchronizing files...{Style.RESET_ALL}")
+            for cmd in sync_commands:
+                subprocess.run(cmd, shell=True, check=True, executable='/bin/bash')
+
+            # Launch jobs
+            self.logger.info(f"{Fore.WHITE}{Style.BRIGHT}Launching jobs...{Style.RESET_ALL}")
+            for cmd in ssh_commands:
+                preview_msg = highlight_command(cmd)
+                self.logger.info(preview_msg, extra={'highlight': True})
+                subprocess.run(cmd, shell=True, check=True, executable='/bin/bash')
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"{Fore.RED}Command failed: {e}{Style.RESET_ALL}")
+            raise
+
+def parse_args():
+    examples = """
+Examples:
+    # 👉 HIGHLY RECOMMENDED: Preview commands before execution
+    ./hq -p myfile -c 4 -m 8     # Always use -p first to verify commands!
+    
+    # Basic usage: Submit a single job
+    ./hq myfile -c 4 -m 8
+    
+    # Submit multiple jobs with different resources
+    ./hq file1 file2 -c 4,8 -m 8,16
+    
+    # Use template expansion for parameter sweep
+    ./hq -c 4,4 -m 8,8 -l 4,5 myfile_D{}
+    # This will create and submit: myfile_D4 and myfile_D5
+    
+    # Submit to a specific cluster with a specific target
+    ./hq myfile -c 4 -m 8 --cluster snellius -t gpu
+    
+    # Use debug target for interactive session
+    ./hq myfile -c 4 -m 8 -t debug
+    
+    # Use bigmem target for large memory jobs
+    ./hq myfile -c 4 -m 8 -t bigmem
+
+Configuration:
+    # First time setup: Generate a sample config
+    ./hq --generate-config
+    
+    The script looks for cluster configurations in ~/.cluster_profile
+    Edit this file to add your clusters and customize settings.
+    See the generated sample config for detailed documentation.
+    
+    You can also specify a custom config file:
+    ./hq myfile -c 4 -m 8 --config /path/to/config.yaml
+    """
+    
+    parser = argparse.ArgumentParser(
+        description=Fore.WHITE + Style.BRIGHT + 'HQ: User-friendly Cluster Job Submission Tool' + Style.RESET_ALL,
+        epilog=examples,
+        formatter_class=ColoredHelpFormatter
+    )
+    
+    # Required arguments
+    parser.add_argument(
+        "files",
+        nargs="*",
+        help="Input files or templates. For templates, use {} as placeholder (e.g., 'sim_D{}' with -l 4,5)"
+    )
+    
+    # Optional arguments
+    parser.add_argument(
+        "--preview", "-p",
+        action="store_true",
+        help="👉 Preview commands without executing them (Recommended for verification)"
+    )
+    parser.add_argument(
+        "--generate-config",
+        action="store_true",
+        help="Generate a sample configuration file at ~/.cluster_profile"
+    )
+    parser.add_argument(
+        "--cores", "-c",
+        type=str,
+        help="Number of CPU cores per job. Use comma-separated values for multiple jobs (e.g., '4,8')"
+    )
+    parser.add_argument(
+        "--memory", "-m",
+        type=str,
+        help="Memory in GB per job. Use comma-separated values for multiple jobs (e.g., '8,16')"
+    )
+    parser.add_argument(
+        "--values", "-l",
+        type=str,
+        help="Values to replace {} in template filenames. Use comma-separated values (e.g., '4,5,6')"
+    )
+    parser.add_argument(
+        "--cluster",
+        type=str,
+        default="oblix",
+        help="Target cluster for job submission. Configure clusters in ~/.cluster_profile"
+    )
+    parser.add_argument(
+        "--target", "-t",
+        type=str,
+        default="default",
+        help="Target configuration to use (e.g., 'default', 'gpu', 'debug', 'bigmem')"
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Path to custom configuration file (default: ~/.cluster_profile)"
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose output showing all commands"
+    )
+    
+    return parser.parse_args()
+
+def expand_template(template: str, values: List[str]) -> List[str]:
+    """Expand a template string with given values."""
+    if '{}' not in template:
+        return [template]
+    return [template.replace('{}', str(value)) for value in values]
+
+def main():
+    args = parse_args()
+    setup_logging(args.verbose)
+    logger = logging.getLogger(__name__)
+    
+    try:
+        # Handle config generation if requested
+        if args.generate_config:
+            config_path = Path.home() / '.cluster_profile'
+            generate_sample_config(config_path)
+            return
+            
+        # Ensure files are provided if not generating config
+        if not args.files:
+            logger.error(f"{Fore.RED}Error: No input files provided. Use --help to see usage examples.{Style.RESET_ALL}")
+            sys.exit(1)
+            
+        cluster_config = ClusterConfig(args.config)
+        job_manager = JobManager(cluster_config)
+        
+        # Parse values for template expansion
+        template_values = args.values.split(',') if args.values else []
+        
+        # Expand template if values are provided
+        if template_values and any('{}' in f for f in args.files):
+            if len(args.files) > 1:
+                raise ValueError("When using template values (-l), provide only one template file")
+            template = args.files[0]
+            expanded_files = expand_template(template, template_values)
+        else:
+            expanded_files = args.files
+        
+        # Create job configurations
+        job_configs = job_manager.process_job_configs(expanded_files, args.cores, args.memory)
+        
+        # Update cluster for all jobs
+        for config in job_configs:
+            config.cluster = args.cluster
+        
+        # Execute or preview
+        job_manager.sync_and_launch_multiple(expanded_files, job_configs, args.preview, args.target)
+        
+    except Exception as e:
+        logger.error(f"{Fore.RED}{str(e)}{Style.RESET_ALL}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
